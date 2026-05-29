@@ -74,7 +74,7 @@ for N in "${SIZES[@]}"; do
 
         echo "[COMPILANDO] $FLAG"
 
-        gcc -std=c99 $FLAG -DN=$N "$ARQUIVO_C" -o "$EXEC"
+        gcc -std=c99 -march=native $FLAG -DN=$N "$ARQUIVO_C" -o "$EXEC"
 
         if [ $? -ne 0 ]; then
             echo "Erro compilando $FLAG" >&2
