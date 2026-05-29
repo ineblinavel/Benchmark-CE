@@ -1,91 +1,192 @@
 #!/bin/bash
 
-# Exigir declaração de variáveis e falhar em caso de erros simples
 set -u
 
-# 1. Verificar dependências de sistema necessárias
-for cmd in gcc size /usr/bin/time taskset; do
+# ================================
+# Verificação de dependências
+# ================================
+for cmd in gcc size /usr/bin/time taskset perf; do
     if ! command -v "$cmd" &> /dev/null && [ ! -f "$cmd" ]; then
-        echo "Erro: O comando '$cmd' não está disponível no sistema." >&2
+        echo "Erro: comando '$cmd' não encontrado." >&2
         exit 1
     fi
 done
 
-# Parâmetros de execução
+# ================================
+# Configurações
+# ================================
 FLAGS=("-O0" "-O1" "-O2" "-O3" "-Ofast")
 SIZES=(256 512 1024 2048)
+
 REPETICOES_PEQUENAS=30
 REPETICOES_GRANDES=10
 
 ARQUIVO_C="matrix_mult.c"
-SAIDA_DADOS="resultados_benchmark.csv"
+EXEC="prog_exec"
 
-# Inicializar cabeçalho do arquivo de saída
-echo "Flag,N,Repeticao,Tempo(s),MemoriaRSS(KB),SegmentoText(Bytes)" > "$SAIDA_DADOS"
+# Alinhado com o arquivo de leitura do script Python
+CSV_OUT="resultados_perf.csv"
 
+# ================================
+# Eventos PERF (L3 mapeado como LLC)
+# ================================
+EVENTS="\
+cycles,\
+instructions,\
+cache-references,\
+cache-misses,\
+branches,\
+branch-misses,\
+L1-dcache-loads,\
+L1-dcache-load-misses,\
+l2_cache_accesses_from_dc_misses,\
+l2_cache_misses_from_dc_misses,\
+LLC-loads,\
+LLC-load-misses"
+
+# ================================
+# Cabeçalho CSV
+# ================================
+echo "Flag,N,Rep,Tempo,RSS,Text,\
+Cycles,Instructions,\
+CacheReferences,CacheMisses,\
+Branches,BranchMisses,\
+L1Loads,L1LoadMisses,\
+L2Access,L2Misses,\
+L3Access,L3Misses" > "$CSV_OUT"
+
+# ================================
+# Benchmark
+# ================================
 for N in "${SIZES[@]}"; do
 
-    # Redução estatística controlada para tamanhos maiores
     if [ "$N" -ge 2048 ]; then
         REP=$REPETICOES_GRANDES
     else
         REP=$REPETICOES_PEQUENAS
     fi
 
-    echo "========================================="
-    echo "Iniciando rodada para N=$N | Amostras: $REP"
-    echo "========================================="
+    echo "======================================"
+    echo "N=$N | Repetições=$REP"
+    echo "======================================"
 
-    for flag in "${FLAGS[@]}"; do
+    for FLAG in "${FLAGS[@]}"; do
 
-        echo "Compilando com $flag..."
+        echo "[COMPILANDO] $FLAG"
 
-        # Compilação forçando o padrão C99 para compatibilidade do modificador restrict
-        gcc -std=c99 $flag -DN=$N "$ARQUIVO_C" -o prog_exec
+        gcc -std=c99 $FLAG -DN=$N "$ARQUIVO_C" -o "$EXEC"
 
         if [ $? -ne 0 ]; then
-            echo "Erro crítico na compilação com $flag para N=$N. Pulando." >&2
+            echo "Erro compilando $FLAG" >&2
             continue
         fi
 
-        # Extração isolada do segmento .text do executável binário
-        TAMANHO_TEXT=$(size prog_exec | awk 'NR==2 {print $1}')
+        TEXT_SIZE=$(size "$EXEC" | awk 'NR==2 {print $1}')
 
-        for i in $(seq 1 "$REP"); do
-            echo " -> Executando $i/$REP ($flag | N=$N)"
+        for ((i=1; i<=REP; i++)); do
 
-            # Randomização eficiente de ambiente em puro Bash (sem forks de processo)
-            # Cria uma string de espaços vazios de tamanho aleatório entre 1 e 4096 bytes
+            echo " -> Execução $i/$REP"
+
             PAD_LEN=$((RANDOM % 4096 + 1))
             printf -v RANDOM_PAD '%*s' "$PAD_LEN" ""
 
-            # Execução fixada na CPU 0 e captura de saídas
-            RESUMO_TIME=$(env PADDING="$RANDOM_PAD" \
-                /usr/bin/time -v taskset -c 0 ./prog_exec 2>&1)
+            OUTPUT=$(env PADDING="$RANDOM_PAD" \
+                /usr/bin/time -v \
+                perf stat \
+                -e "$EVENTS" \
+                taskset -c 0 ./"$EXEC" \
+                2>&1)
 
-            # Parsing robusto utilizando âncoras textuais estruturadas do awk
-            TEMPO_C=$(echo "$RESUMO_TIME" | awk '/TEMPO:/ {print $2}')
-            MEMORIA_RSS=$(echo "$RESUMO_TIME" | awk -F': ' '/Maximum resident set size/ {print $2}')
+            # ============================
+            # Extração tempo/RSS
+            # ============================
+            TEMPO=$(echo "$OUTPUT" | awk '/TEMPO:/ {print $2}')
+            RSS=$(echo "$OUTPUT" | awk -F': ' '/Maximum resident set size/ {print $2}')
 
-            # Validação defensiva de dados coletados
-            if [ -z "$TEMPO_C" ] || [ -z "$MEMORIA_RSS" ]; then
-                echo "Aviso: Coleta corrompida na rodada $i de $flag (N=$N). Descartando amostra." >&2
+            # ============================
+            # PERF counters
+            # ============================
+            extract_perf () {
+                echo "$OUTPUT" | \
+                grep "$1" | \
+                head -n1 | \
+                awk '{print $1}' | \
+                tr -d ','
+            }
+
+            CYCLES=$(extract_perf "cycles")
+            INSTR=$(extract_perf "instructions")
+            CACHE_REF=$(extract_perf "cache-references")
+            CACHE_MISS=$(extract_perf "cache-misses")
+            BRANCHES=$(extract_perf "branches")
+            BRANCH_MISS=$(extract_perf "branch-misses")
+
+            L1_LOADS=$(extract_perf "L1-dcache-loads")
+            L1_MISS=$(extract_perf "L1-dcache-load-misses")
+
+            L2_ACCESS=$(extract_perf "l2_cache_accesses_from_dc_misses")
+            L2_MISS=$(extract_perf "l2_cache_misses_from_dc_misses")
+
+            # Mapeamento atualizado para aliases genéricos do LLC (L3)
+            L3_ACCESS=$(extract_perf "LLC-loads")
+            L3_MISS=$(extract_perf "LLC-load-misses")
+
+            # ============================
+            # Sanitização
+            # ============================
+            sanitize () {
+                local val="$1"
+
+                if [[ -z "$val" || "$val" == "<not"* ]]; then
+                    echo "NA"
+                else
+                    echo "$val"
+                fi
+            }
+
+            CYCLES=$(sanitize "$CYCLES")
+            INSTR=$(sanitize "$INSTR")
+            CACHE_REF=$(sanitize "$CACHE_REF")
+            CACHE_MISS=$(sanitize "$CACHE_MISS")
+            BRANCHES=$(sanitize "$BRANCHES")
+            BRANCH_MISS=$(sanitize "$BRANCH_MISS")
+            L1_LOADS=$(sanitize "$L1_LOADS")
+            L1_MISS=$(sanitize "$L1_MISS")
+            L2_ACCESS=$(sanitize "$L2_ACCESS")
+            L2_MISS=$(sanitize "$L2_MISS")
+            L3_ACCESS=$(sanitize "$L3_ACCESS")
+            L3_MISS=$(sanitize "$L3_MISS")
+
+            # ============================
+            # Validação
+            # ============================
+            if [ -z "$TEMPO" ] || [ -z "$RSS" ]; then
+                echo "Amostra inválida. Ignorando..." >&2
                 continue
             fi
 
-            # Exportação de resultados seguros
-            echo "$flag,$N,$i,$TEMPO_C,$MEMORIA_RSS,$TAMANHO_TEXT" >> "$SAIDA_DADOS"
+            # ============================
+            # CSV
+            # ============================
+            echo "$FLAG,$N,$i,$TEMPO,$RSS,$TEXT_SIZE,\
+$CYCLES,$INSTR,\
+$CACHE_REF,$CACHE_MISS,\
+$BRANCHES,$BRANCH_MISS,\
+$L1_LOADS,$L1_MISS,\
+$L2_ACCESS,$L2_MISS,\
+$L3_ACCESS,$L3_MISS" >> "$CSV_OUT"
+
         done
 
-        echo "Concluído: $flag para N=$N"
-        echo "-----------------------------------------"
+        echo "[OK] $FLAG concluído"
+        echo "--------------------------------------"
+
     done
 done
 
-# Limpeza do executável temporário
-rm -f prog_exec
+rm -f "$EXEC"
 
-echo "========================================="
-echo "Experimento finalizado com sucesso!"
-echo "Resultados consolidados em: $SAIDA_DADOS"
-echo "========================================="
+echo "======================================"
+echo "Benchmark finalizado!"
+echo "Saída: $CSV_OUT"
+echo "======================================"
